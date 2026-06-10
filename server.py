@@ -683,6 +683,95 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="gmail_create_label",
+            description=(
+                "Create a new user label in a Gmail account. Additive and easily "
+                "reversible (delete the label to undo), so it is applied directly "
+                "without a confirmation step."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Account name"},
+                    "name": {
+                        "type": "string",
+                        "description": "Label name. Use '/' to nest, e.g. 'Clients/Acme'.",
+                    },
+                    "label_list_visibility": {
+                        "type": "string",
+                        "enum": ["labelShow", "labelShowIfUnread", "labelHide"],
+                        "description": "Whether the label shows in the label list. Default labelShow.",
+                    },
+                    "message_list_visibility": {
+                        "type": "string",
+                        "enum": ["show", "hide"],
+                        "description": "Whether the label shows on messages in the message list. Default show.",
+                    },
+                },
+                "required": ["account", "name"],
+            },
+        ),
+        types.Tool(
+            name="gmail_update_label",
+            description=(
+                "Rename a user label or change its visibility. Reversible, so applied "
+                "directly. System labels (INBOX, STARRED, etc.) cannot be renamed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Account name"},
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID to update (from gmail_list_labels)",
+                    },
+                    "name": {"type": "string", "description": "New label name (optional)"},
+                    "label_list_visibility": {
+                        "type": "string",
+                        "enum": ["labelShow", "labelShowIfUnread", "labelHide"],
+                        "description": "New label-list visibility (optional)",
+                    },
+                    "message_list_visibility": {
+                        "type": "string",
+                        "enum": ["show", "hide"],
+                        "description": "New message-list visibility (optional)",
+                    },
+                },
+                "required": ["account", "label_id"],
+            },
+        ),
+        types.Tool(
+            name="gmail_delete_label",
+            description=(
+                "Permanently delete a user label from a Gmail account. DESTRUCTIVE and "
+                "irreversible — the label is removed from every message it was applied to "
+                "(the messages themselves are NOT deleted). Requires confirmation: first "
+                "call (without `confirm`) returns a preview; call again with `confirm: true` "
+                "and the preview's `confirmation_token` to actually delete. System labels "
+                "cannot be deleted."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Account name"},
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID to delete (from gmail_list_labels)",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Set to true only with a confirmation_token returned by a reviewed preview.",
+                        "default": False,
+                    },
+                    "confirmation_token": {
+                        "type": "string",
+                        "description": "One-time token returned by this tool's preview response.",
+                    },
+                },
+                "required": ["account", "label_id"],
+            },
+        ),
+        types.Tool(
             name="gmail_trash",
             description=(
                 "Move a Gmail message to the Trash. "
@@ -1065,6 +1154,50 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 remove_labels=args.get("remove_labels"),
             )
             return _fmt({"status": "labels updated", "message_id": args["message_id"]})
+
+        # ---- gmail_create_label ------------------------------------------
+        elif name == "gmail_create_label":
+            _check_account(args["account"])
+            _audit("gmail_create_label", args["account"], {"name": args["name"]})
+            svc = _get_service(args["account"])
+            label = svc.create_label(
+                name=args["name"],
+                label_list_visibility=args.get("label_list_visibility", "labelShow"),
+                message_list_visibility=args.get("message_list_visibility", "show"),
+            )
+            return _fmt({"status": "label created", "label": label})
+
+        # ---- gmail_update_label ------------------------------------------
+        elif name == "gmail_update_label":
+            _check_account(args["account"])
+            _audit("gmail_update_label", args["account"], {
+                "label_id": args["label_id"],
+                "name": args.get("name"),
+            })
+            svc = _get_service(args["account"])
+            label = svc.update_label(
+                label_id=args["label_id"],
+                name=args.get("name"),
+                label_list_visibility=args.get("label_list_visibility"),
+                message_list_visibility=args.get("message_list_visibility"),
+            )
+            return _fmt({"status": "label updated", "label": label})
+
+        # ---- gmail_delete_label ------------------------------------------
+        elif name == "gmail_delete_label":
+            _check_account(args["account"])
+            if bool(args.get("confirm", False)):
+                _require_confirmation("gmail_delete_label", args)
+            preview_details = {
+                "account": args["account"],
+                "label_id": args["label_id"],
+            }
+            if not bool(args.get("confirm", False)):
+                return _preview("gmail_delete_label", preview_details, args)
+            _audit("gmail_delete_label", args["account"], preview_details)
+            svc = _get_service(args["account"])
+            svc.delete_label(args["label_id"])
+            return _fmt({"status": "label deleted", "label_id": args["label_id"]})
 
         # ---- gmail_trash -------------------------------------------------
         elif name == "gmail_trash":

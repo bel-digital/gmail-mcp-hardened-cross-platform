@@ -304,6 +304,42 @@ class GmailService:
             userId="me", id=message_id, body=body
         ).execute()
 
+    def create_label(
+        self,
+        name: str,
+        label_list_visibility: str = "labelShow",
+        message_list_visibility: str = "show",
+    ) -> Dict[str, Any]:
+        body = {
+            "name": name,
+            "labelListVisibility": label_list_visibility,
+            "messageListVisibility": message_list_visibility,
+        }
+        lbl = self.service.users().labels().create(userId="me", body=body).execute()
+        return {"id": lbl["id"], "name": lbl["name"], "type": lbl.get("type", "")}
+
+    def update_label(
+        self,
+        label_id: str,
+        name: Optional[str] = None,
+        label_list_visibility: Optional[str] = None,
+        message_list_visibility: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"id": label_id}
+        if name is not None:
+            body["name"] = name
+        if label_list_visibility is not None:
+            body["labelListVisibility"] = label_list_visibility
+        if message_list_visibility is not None:
+            body["messageListVisibility"] = message_list_visibility
+        lbl = self.service.users().labels().patch(
+            userId="me", id=label_id, body=body
+        ).execute()
+        return {"id": lbl["id"], "name": lbl["name"], "type": lbl.get("type", "")}
+
+    def delete_label(self, label_id: str) -> None:
+        self.service.users().labels().delete(userId="me", id=label_id).execute()
+
     def trash_message(self, message_id: str) -> Dict[str, Any]:
         return self.service.users().messages().trash(
             userId="me", id=message_id
