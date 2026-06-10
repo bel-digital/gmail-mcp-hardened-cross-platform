@@ -278,6 +278,40 @@ def _validate_attachment_read_path(path_str: str) -> Path:
     )
 
 
+def _validate_inline_images(
+    raw_inline_images: list | None, body_html: str | None
+) -> list[dict]:
+    """Validate inline-image entries for an HTML email.
+
+    Each entry must be an object with a 'cid' (referenced from the HTML as
+    <img src="cid:CID">) and a 'path'. The path runs through the same allowlist
+    as attachments (_validate_attachment_read_path). Inline images require an
+    HTML body because a CID is only referenced from HTML.
+
+    Returns a list of {'cid': str, 'path': str} with validated absolute paths.
+    """
+    items = raw_inline_images or []
+    if items and not body_html:
+        raise ValueError(
+            "inline_images require body_html; a CID is only referenced from the HTML body."
+        )
+    validated: list[dict] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Each inline_images entry must be an object with 'cid' and 'path'."
+            )
+        cid = entry.get("cid")
+        path = entry.get("path")
+        if not cid or not path:
+            raise ValueError(
+                "Each inline_images entry must have both 'cid' and 'path'."
+            )
+        validated_path = _validate_attachment_read_path(path)
+        validated.append({"cid": cid, "path": str(validated_path)})
+    return validated
+
+
 def _validate_save_dir(dir_str: Optional[str], create: bool = True) -> Path:
     """Resolve and validate a directory the caller wants to SAVE a download into.
 
@@ -466,6 +500,37 @@ async def list_tools() -> list[types.Tool]:
                             "must be under ~25 MB (Gmail's per-message limit)."
                         ),
                     },
+                    "body_html": {
+                        "type": "string",
+                        "description": (
+                            "Optional HTML body. When provided, the message is built as "
+                            "multipart/alternative (text/plain from 'body' plus this HTML); "
+                            "clients that render HTML show this version. Required when using "
+                            "inline_images."
+                        ),
+                    },
+                    "inline_images": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cid": {
+                                    "type": "string",
+                                    "description": "Content-ID referenced from the HTML as <img src=\"cid:CID\">.",
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Absolute path to the image file (same allowlist as attachments).",
+                                },
+                            },
+                            "required": ["cid", "path"],
+                        },
+                        "description": (
+                            "Optional inline images embedded in the HTML body (e.g. a logo "
+                            "footer or signature). Requires body_html. Reference each image "
+                            "from the HTML via its CID: <img src=\"cid:CID\">."
+                        ),
+                    },
                     "confirm": {
                         "type": "boolean",
                         "description": "Set to true only with a confirmation_token returned by a reviewed preview.",
@@ -506,6 +571,37 @@ async def list_tools() -> list[types.Tool]:
                         "description": (
                             "Optional list of absolute file paths to attach. Each must be inside "
                             "~/Downloads, ~/Documents, or ~/Desktop. Total <25 MB."
+                        ),
+                    },
+                    "body_html": {
+                        "type": "string",
+                        "description": (
+                            "Optional HTML body. When provided, the draft is built as "
+                            "multipart/alternative (text/plain from 'body' plus this HTML); "
+                            "clients that render HTML show this version. Required when using "
+                            "inline_images."
+                        ),
+                    },
+                    "inline_images": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cid": {
+                                    "type": "string",
+                                    "description": "Content-ID referenced from the HTML as <img src=\"cid:CID\">.",
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Absolute path to the image file (same allowlist as attachments).",
+                                },
+                            },
+                            "required": ["cid", "path"],
+                        },
+                        "description": (
+                            "Optional inline images embedded in the HTML body (e.g. a logo "
+                            "footer or signature). Requires body_html. Reference each image "
+                            "from the HTML via its CID: <img src=\"cid:CID\">."
                         ),
                     },
                     "confirm": {
@@ -828,6 +924,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
             if bool(args.get("confirm", False)):
                 _require_confirmation("gmail_send", args)
             body = args["body"]
+            body_html = args.get("body_html")
             # Validate every attachment path up front (raises ValueError on failure,
             # which the top-level handler returns to the LLM verbatim).
             raw_attachments = args.get("attachments") or []
@@ -838,6 +935,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 {"path": str(p), "filename": p.name, "size_bytes": p.stat().st_size}
                 for p in validated_attachments
             ]
+            # Inline images follow the same path allowlist as attachments.
+            validated_inline_images = _validate_inline_images(
+                args.get("inline_images"), body_html
+            )
             preview_details = {
                 "account": args["account"],
                 "from": _accounts[args["account"]].get("email", ""),
@@ -847,9 +948,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 "subject": args["subject"],
                 "body_preview": body if len(body) <= 500 else body[:500] + "… (truncated)",
                 "body_length": len(body),
+                "html_body_included": bool(body_html),
                 "attachments": attachment_preview,
                 "attachment_count": len(attachment_preview),
                 "attachment_total_bytes": sum(a["size_bytes"] for a in attachment_preview),
+                "inline_images": validated_inline_images,
+                "inline_image_count": len(validated_inline_images),
             }
             if not bool(args.get("confirm", False)):
                 return _preview("gmail_send", preview_details, args)
@@ -864,6 +968,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 cc=args.get("cc", ""),
                 bcc=args.get("bcc", ""),
                 attachments=validated_attachments,
+                body_html=body_html,
+                inline_images=validated_inline_images,
             )
             return _fmt({
                 "status": "sent",
@@ -877,10 +983,15 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
             _check_account(args["account"])
             if bool(args.get("confirm", False)):
                 _require_confirmation("gmail_create_draft", args)
+            body_html = args.get("body_html")
             raw_attachments = args.get("attachments") or []
             validated_attachments = [
                 _validate_attachment_read_path(p) for p in raw_attachments
             ]
+            # Inline images follow the same path allowlist as attachments.
+            validated_inline_images = _validate_inline_images(
+                args.get("inline_images"), body_html
+            )
             preview_details = {
                 "account": args["account"],
                 "from": _accounts[args["account"]].get("email", ""),
@@ -894,8 +1005,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                     else args["body"][:500] + "… (truncated)"
                 ),
                 "body_length": len(args["body"]),
+                "html_body_included": bool(body_html),
                 "attachments": [str(p) for p in validated_attachments],
                 "attachment_count": len(validated_attachments),
+                "inline_images": validated_inline_images,
+                "inline_image_count": len(validated_inline_images),
             }
             if not bool(args.get("confirm", False)):
                 return _preview("gmail_create_draft", preview_details, args)
@@ -910,6 +1024,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 cc=args.get("cc", ""),
                 bcc=args.get("bcc", ""),
                 attachments=validated_attachments,
+                body_html=body_html,
+                inline_images=validated_inline_images,
             )
             return _fmt({
                 "status": "draft created",

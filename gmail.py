@@ -89,8 +89,12 @@ class GmailService:
         cc: str = "",
         bcc: str = "",
         attachments: Optional[List[Union[str, Path]]] = None,
+        body_html: Optional[str] = None,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
-        msg = self._build_message(to, subject, body, cc, bcc, attachments)
+        msg = self._build_message(
+            to, subject, body, cc, bcc, attachments, body_html, inline_images
+        )
         return self.service.users().messages().send(
             userId="me", body={"raw": self._encode(msg)}
         ).execute()
@@ -103,8 +107,12 @@ class GmailService:
         cc: str = "",
         bcc: str = "",
         attachments: Optional[List[Union[str, Path]]] = None,
+        body_html: Optional[str] = None,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
-        msg = self._build_message(to, subject, body, cc, bcc, attachments)
+        msg = self._build_message(
+            to, subject, body, cc, bcc, attachments, body_html, inline_images
+        )
         return self.service.users().drafts().create(
             userId="me", body={"message": {"raw": self._encode(msg)}}
         ).execute()
@@ -117,58 +125,136 @@ class GmailService:
         cc: str,
         bcc: str,
         attachments: Optional[List[Union[str, Path]]],
+        body_html: Optional[str] = None,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> Union[MIMEText, MIMEMultipart]:
-        """Build a plain-text MIMEText or a multipart message with attachments.
+        """Build a plain-text, HTML, or multipart message.
 
-        Path validation is the caller's responsibility (see server._validate_attachment_path).
-        We assume each path is a regular file the user is allowed to read.
+        Path validation is the caller's responsibility (see
+        server._validate_attachment_read_path). We assume each path is a
+        regular file the user is allowed to read.
+
+        Structure (innermost outward, only what is needed is built):
+          text/plain                                              (always)
+          + multipart/alternative wrapping text/plain + text/html (if body_html)
+          + multipart/related wrapping the above + inline images  (if inline_images)
+          + multipart/mixed wrapping the above + file attachments (if attachments)
         """
-        if not attachments:
-            msg = MIMEText(body, "plain")
-            msg["to"] = to
-            msg["subject"] = subject
-            if cc:
-                msg["cc"] = cc
-            if bcc:
-                msg["bcc"] = bcc
-            return msg
+        inline_images = inline_images or []
+        attachments = attachments or []
 
-        # Multipart path
-        msg = MIMEMultipart()
-        msg["to"] = to
-        msg["subject"] = subject
-        if cc:
-            msg["cc"] = cc
-        if bcc:
-            msg["bcc"] = bcc
-        msg.attach(MIMEText(body, "plain"))
-
-        total_bytes = 0
-        for raw_path in attachments:
-            path = Path(raw_path)
-            with open(path, "rb") as f:
-                data = f.read()
-            total_bytes += len(data)
-            if total_bytes > _MAX_ATTACHMENT_BYTES_TOTAL:
-                raise ValueError(
-                    f"Attachments exceed Gmail's ~25 MB per-message limit "
-                    f"(running total: {total_bytes} bytes)."
-                )
-            mime_type, _ = mimetypes.guess_type(str(path))
-            if mime_type is None:
-                mime_type = "application/octet-stream"
-            maintype, _, subtype = mime_type.partition("/")
-            part = MIMEBase(maintype, subtype or "octet-stream")
-            part.set_payload(data)
-            encoders.encode_base64(part)
-            part.add_header(
-                "Content-Disposition",
-                "attachment",
-                filename=os.path.basename(path),
+        if inline_images and not body_html:
+            raise ValueError(
+                "inline_images require body_html; a CID is only referenced from the HTML body."
             )
-            msg.attach(part)
 
-        return msg
+        total_bytes = 0  # shared running total across inline images + attachments
+
+        # Innermost: plain text, or multipart/alternative when HTML is also given.
+        if body_html:
+            inner: Union[MIMEText, MIMEMultipart] = MIMEMultipart("alternative")
+            inner.attach(MIMEText(body, "plain"))
+            inner.attach(MIMEText(body_html, "html"))
+        else:
+            inner = MIMEText(body, "plain")
+
+        # Wrap in multipart/related for inline (CID-referenced) images.
+        if inline_images:
+            related = MIMEMultipart("related")
+            related.attach(inner)
+            for img in inline_images:
+                total_bytes = GmailService._attach_inline_image(
+                    related, img, total_bytes
+                )
+            inner = related
+
+        # Wrap in multipart/mixed for regular file attachments.
+        if attachments:
+            outer: Union[MIMEText, MIMEMultipart] = MIMEMultipart("mixed")
+            outer.attach(inner)
+            for raw_path in attachments:
+                total_bytes = GmailService._attach_file(outer, raw_path, total_bytes)
+        else:
+            outer = inner
+
+        outer["to"] = to
+        outer["subject"] = subject
+        if cc:
+            outer["cc"] = cc
+        if bcc:
+            outer["bcc"] = bcc
+        return outer
+
+    @staticmethod
+    def _attach_file(
+        msg: MIMEMultipart, raw_path: Union[str, Path], total_bytes: int
+    ) -> int:
+        """Attach a regular file part; returns the updated running byte total."""
+        path = Path(raw_path)
+        with open(path, "rb") as f:
+            data = f.read()
+        total_bytes += len(data)
+        if total_bytes > _MAX_ATTACHMENT_BYTES_TOTAL:
+            raise ValueError(
+                f"Attachments exceed Gmail's ~25 MB per-message limit "
+                f"(running total: {total_bytes} bytes)."
+            )
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+        maintype, _, subtype = mime_type.partition("/")
+        part = MIMEBase(maintype, subtype or "octet-stream")
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=os.path.basename(path),
+        )
+        msg.attach(part)
+        return total_bytes
+
+    @staticmethod
+    def _attach_inline_image(
+        msg: MIMEMultipart, img: Dict[str, str], total_bytes: int
+    ) -> int:
+        """Attach an inline image referenced from the HTML body via <img src="cid:CID">.
+
+        Returns the updated running byte total (shared with file attachments so
+        the combined message stays under Gmail's ~25 MB cap).
+        """
+        cid = (img or {}).get("cid")
+        path_str = (img or {}).get("path")
+        if not cid or not path_str:
+            raise ValueError(
+                "Each inline_images entry must have both 'cid' and 'path'."
+            )
+        path = Path(path_str)
+        with open(path, "rb") as f:
+            data = f.read()
+        total_bytes += len(data)
+        if total_bytes > _MAX_ATTACHMENT_BYTES_TOTAL:
+            raise ValueError(
+                f"Inline images + attachments exceed Gmail's ~25 MB per-message "
+                f"limit (running total: {total_bytes} bytes)."
+            )
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if mime_type is None or not mime_type.startswith("image/"):
+            raise ValueError(
+                f"Inline image must be an image/* file; got {mime_type} for {path}."
+            )
+        maintype, _, subtype = mime_type.partition("/")
+        part = MIMEBase(maintype, subtype or "octet-stream")
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        # Normalize the CID (strip any caller-supplied angle brackets), then wrap.
+        clean_cid = cid.strip().lstrip("<").rstrip(">")
+        part.add_header("Content-ID", f"<{clean_cid}>")
+        part.add_header(
+            "Content-Disposition", "inline", filename=os.path.basename(path)
+        )
+        msg.attach(part)
+        return total_bytes
 
     def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
         """Fetch a single attachment's raw bytes by ID."""
