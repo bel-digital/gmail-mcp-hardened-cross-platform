@@ -619,14 +619,19 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="gmail_list_drafts",
-            description="List draft emails in a Gmail account.",
+            description=(
+                "List draft emails in a Gmail account, newest first. Pages through "
+                "the account up to max_results (ceiling 1000) and waits out Gmail's "
+                "per-minute rate limit, so a few hundred drafts can take several "
+                "minutes. A count equal to max_results may mean more drafts exist."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "account": {"type": "string", "description": "Account name"},
                     "max_results": {
                         "type": "integer",
-                        "description": "Max drafts to return (default 10)",
+                        "description": "Max drafts to return (default 10, ceiling 1000)",
                         "default": 10,
                     },
                 },
