@@ -42,6 +42,8 @@ class ServerToolSmokeTest(unittest.TestCase):
             "gmail_download_attachment",
             "calendar_list_calendars",
             "calendar_list_events",
+            "calendar_list_event_colors",
+            "calendar_set_event_color",
         }
         self.assertTrue(required.issubset(names))
         self.assertFalse(any("drive" in name.lower() for name in names))
@@ -52,8 +54,143 @@ class ServerToolSmokeTest(unittest.TestCase):
                 "https://www.googleapis.com/auth/gmail.modify",
                 "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
                 "https://www.googleapis.com/auth/calendar.events.readonly",
+                # Read/write on events. The ONLY write scope on Calendar, added
+                # 26 Aug 2026 for calendar_set_event_color. If this list grows
+                # again, that is a deliberate decision and this test is the gate.
+                "https://www.googleapis.com/auth/calendar.events",
             ],
         )
+        # Colour is the only thing this server may write to Calendar. There is
+        # deliberately no create, no delete, and no general event edit.
+        self.assertFalse(
+            any(
+                name.startswith("calendar_")
+                and name not in {
+                    "calendar_list_calendars",
+                    "calendar_list_events",
+                    "calendar_search",
+                    "calendar_get_event",
+                    "calendar_list_event_colors",
+                    "calendar_set_event_color",
+                }
+                for name in names
+            )
+        )
+
+    def test_event_colour_write_requires_preview_token(self) -> None:
+        import server
+
+        args = {
+            "account": "bel@",
+            "event_id": "evt-123",
+            "color_id": "2",
+        }
+
+        class _FakeCalendar:
+            patched = False
+
+            def get_event(self, event_id, calendar_id="primary"):
+                return {
+                    "id": event_id,
+                    "summary": "Dinner - Venison pie",
+                    "start": "2026-09-03",
+                    "colorId": "",
+                    "colorName": "Default",
+                }
+
+            def set_event_color(self, event_id, color_id, calendar_id="primary"):
+                _FakeCalendar.patched = True
+                return {"status": "updated", "event": {"id": event_id}}
+
+        fake = _FakeCalendar()
+        with patch.object(server, "_get_calendar", return_value=fake), patch.object(
+            server, "_check_account", return_value=None
+        ):
+            preview = asyncio.run(
+                server.call_tool("calendar_set_event_color", dict(args))
+            )
+            payload = json.loads(preview[0].text)
+            self.assertEqual(payload["status"], "preview_only — NOT executed")
+            self.assertFalse(_FakeCalendar.patched, "preview must not write")
+            self.assertIn("Sage", payload["details"]["new_color"])
+
+            # A confirm without the token must be refused.
+            refused = asyncio.run(
+                server.call_tool(
+                    "calendar_set_event_color", {**args, "confirm": True}
+                )
+            )
+            self.assertIn("confirmation_token", refused[0].text)
+            self.assertFalse(_FakeCalendar.patched)
+
+            # Changing the colour after the preview must invalidate the token.
+            mutated = asyncio.run(
+                server.call_tool(
+                    "calendar_set_event_color",
+                    {
+                        **args,
+                        "color_id": "11",
+                        "confirm": True,
+                        "confirmation_token": payload["confirmation_token"],
+                    },
+                )
+            )
+            self.assertIn("Error", mutated[0].text)
+            self.assertFalse(_FakeCalendar.patched)
+
+            # That failed attempt CONSUMED the token, even though it did not
+            # execute. Reusing it with the original arguments must still fail —
+            # a token is single-use whatever the outcome, so a mismatch cannot
+            # be retried against variations of the same preview.
+            reused = asyncio.run(
+                server.call_tool(
+                    "calendar_set_event_color",
+                    {
+                        **args,
+                        "confirm": True,
+                        "confirmation_token": payload["confirmation_token"],
+                    },
+                )
+            )
+            self.assertIn("Error", reused[0].text)
+            self.assertFalse(_FakeCalendar.patched)
+
+            # A fresh preview issues a fresh token, and that one executes.
+            second = json.loads(
+                asyncio.run(
+                    server.call_tool("calendar_set_event_color", dict(args))
+                )[0].text
+            )
+            done = asyncio.run(
+                server.call_tool(
+                    "calendar_set_event_color",
+                    {
+                        **args,
+                        "confirm": True,
+                        "confirmation_token": second["confirmation_token"],
+                    },
+                )
+            )
+            self.assertTrue(_FakeCalendar.patched)
+            self.assertIn("updated", done[0].text)
+
+    def test_unknown_colour_id_is_rejected_before_any_call(self) -> None:
+        import server
+
+        class _Boom:
+            def get_event(self, *a, **k):
+                raise AssertionError("must not reach Google with a bad colour")
+
+        with patch.object(server, "_get_calendar", return_value=_Boom()), patch.object(
+            server, "_check_account", return_value=None
+        ):
+            out = asyncio.run(
+                server.call_tool(
+                    "calendar_set_event_color",
+                    {"account": "bel@", "event_id": "e", "color_id": "42"},
+                )
+            )
+        self.assertIn("Unknown color_id", out[0].text)
 
     def test_download_subdirectory_can_be_created_under_new_allowed_root(self) -> None:
         import server
