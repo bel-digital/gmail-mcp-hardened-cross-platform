@@ -17,6 +17,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
     "https://www.googleapis.com/auth/calendar.events.readonly",
+    # Read/write on events. Added 26 Aug 2026 for calendar_set_event_color,
+    # which is the only tool here that writes to Calendar. Everything else
+    # remains read-only.
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
 # Account names are used as filenames in credentials/tokens/. Restrict to a

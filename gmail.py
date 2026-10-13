@@ -2,6 +2,7 @@ import base64
 import mimetypes
 import os
 import re
+import time
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # MIME trees in real-world mail rarely nest more than a few levels deep
 # (multipart/mixed → multipart/alternative → text). 20 leaves generous
@@ -22,6 +24,31 @@ _MAX_MIME_DEPTH = 20
 # ~25 MB. We surface this as a soft check before the API call so the user
 # sees a clear error instead of a generic HttpError from Google.
 _MAX_ATTACHMENT_BYTES_TOTAL = 25 * 1024 * 1024
+
+# Gmail enforces a per-user, per-minute quota. Fetching a few hundred full
+# drafts in one call trips it (measured 2026-10-12: about 144 draft gets,
+# then 403 rateLimitExceeded). A fixed wait outlasts the window reliably,
+# where the client library's randomised backoff can give up inside it.
+_RATE_LIMIT_WAIT_SECONDS = 20
+_RATE_LIMIT_ATTEMPTS = 6
+
+
+def _is_rate_limited(err: HttpError) -> bool:
+    status = getattr(err.resp, "status", None)
+    if status == 429:
+        return True
+    return status == 403 and b"ratelimitexceeded" in (err.content or b"").lower()
+
+
+def _execute_with_backoff(make_request, attempts: int = _RATE_LIMIT_ATTEMPTS):
+    """Run make_request().execute(), waiting out Gmail rate limits."""
+    for attempt in range(attempts):
+        try:
+            return make_request().execute()
+        except HttpError as err:
+            if attempt == attempts - 1 or not _is_rate_limited(err):
+                raise
+            time.sleep(_RATE_LIMIT_WAIT_SECONDS)
 
 
 class GmailService:
@@ -263,16 +290,43 @@ class GmailService:
         ).execute()
         return base64.urlsafe_b64decode(result["data"].encode())
 
+    # Hard ceiling on drafts returned in one call. Each draft costs a full
+    # drafts.get, so this bounds the API calls and the response size.
+    MAX_DRAFTS = 1000
+
     def list_drafts(self, max_results: int = 20) -> List[Dict[str, Any]]:
-        result = self.service.users().drafts().list(
-            userId="me", maxResults=min(max_results, 50)
-        ).execute()
+        """List up to max_results drafts, newest first, following pageToken.
+
+        The previous version made a single drafts.list call capped at 50 and
+        never paged, so any draft outside the 50 most recent was invisible.
+        A returned count equal to max_results may still mean more exist.
+        """
+        limit = max(1, min(int(max_results), self.MAX_DRAFTS))
+        refs: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        while len(refs) < limit:
+            params: Dict[str, Any] = {
+                "userId": "me",
+                "maxResults": min(limit - len(refs), 100),
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            result = _execute_with_backoff(
+                lambda: self.service.users().drafts().list(**params)
+            )
+            batch = result.get("drafts", [])
+            refs.extend(batch)
+            page_token = result.get("nextPageToken")
+            if not page_token or not batch:
+                break
 
         drafts = []
-        for draft in result.get("drafts", []):
-            details = self.service.users().drafts().get(
-                userId="me", id=draft["id"], format="full"
-            ).execute()
+        for draft in refs[:limit]:
+            details = _execute_with_backoff(
+                lambda: self.service.users().drafts().get(
+                    userId="me", id=draft["id"], format="full"
+                )
+            )
             msg = self._parse_message(details.get("message", {}))
             msg["draft_id"] = draft["id"]
             drafts.append(msg)

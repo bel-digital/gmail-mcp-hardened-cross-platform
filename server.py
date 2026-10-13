@@ -25,7 +25,7 @@ from mcp.server.stdio import stdio_server
 
 from auth import AuthManager
 from config import get_accounts, get_client_secret_path, get_credentials_dir, load_config
-from gcalendar import CalendarService
+from gcalendar import EVENT_COLOR_NAMES, CalendarService
 from gmail import GmailService
 
 # ---------------------------------------------------------------------------
@@ -619,14 +619,19 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="gmail_list_drafts",
-            description="List draft emails in a Gmail account.",
+            description=(
+                "List draft emails in a Gmail account, newest first. Pages through "
+                "the account up to max_results (ceiling 1000) and waits out Gmail's "
+                "per-minute rate limit, so a few hundred drafts can take several "
+                "minutes. A count equal to max_results may mean more drafts exist."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "account": {"type": "string", "description": "Account name"},
                     "max_results": {
                         "type": "integer",
-                        "description": "Max drafts to return (default 10)",
+                        "description": "Max drafts to return (default 10, ceiling 1000)",
                         "default": 10,
                     },
                 },
@@ -936,6 +941,64 @@ async def list_tools() -> list[types.Tool]:
                     },
                 },
                 "required": ["account", "event_id"],
+            },
+        ),
+        types.Tool(
+            name="calendar_list_event_colors",
+            description=(
+                "List the eleven colours an event can be set to, with their numeric "
+                "colorId, Calendar UI name (Lavender, Sage, Grape...) and hex values. "
+                "Read-only. Use it to translate a colour name into the colorId that "
+                "calendar_set_event_color needs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Account name"},
+                },
+                "required": ["account"],
+            },
+        ),
+        types.Tool(
+            name="calendar_set_event_color",
+            description=(
+                "Set the colour of an existing calendar event. This is a patch update: "
+                "only the colour changes and no other field on the event is touched. "
+                "Attendees are NOT notified. Returns a preview first; call again with "
+                "`confirm: true` and the preview's `confirmation_token` to apply. "
+                "Requires the calendar.events scope — if the token predates it, this "
+                "returns HTTP 403 and setup_auth.py must be re-run."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Account name"},
+                    "event_id": {"type": "string", "description": "Event ID (from list, search or get)"},
+                    "color_id": {
+                        "type": "string",
+                        "description": (
+                            "Colour to apply: '1' Lavender, '2' Sage, '3' Grape, '4' Flamingo, "
+                            "'5' Banana, '6' Tangerine, '7' Peacock, '8' Graphite, '9' Blueberry, "
+                            "'10' Basil, '11' Tomato. Pass '' to clear the override so the event "
+                            "inherits its calendar's colour."
+                        ),
+                    },
+                    "calendar_id": {
+                        "type": "string",
+                        "description": "Calendar ID (default: 'primary')",
+                        "default": "primary",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Set to true only with a confirmation_token returned by a reviewed preview.",
+                        "default": False,
+                    },
+                    "confirmation_token": {
+                        "type": "string",
+                        "description": "Single-use token from the preview response. Expires in 10 minutes.",
+                    },
+                },
+                "required": ["account", "event_id", "color_id"],
             },
         ),
     ]
@@ -1306,6 +1369,68 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
                 event_id=args["event_id"],
                 calendar_id=args.get("calendar_id", "primary"),
             ))
+
+        # ---- calendar_list_event_colors -----------------------------------
+        elif name == "calendar_list_event_colors":
+            svc = _get_calendar(args["account"])
+            return _fmt(svc.list_event_colors())
+
+        # ---- calendar_set_event_color -------------------------------------
+        elif name == "calendar_set_event_color":
+            _check_account(args["account"])
+            svc = _get_calendar(args["account"])
+            calendar_id = args.get("calendar_id", "primary")
+            color_id = (args.get("color_id") or "").strip()
+
+            if color_id and color_id not in EVENT_COLOR_NAMES:
+                raise ValueError(
+                    f"Unknown color_id {color_id!r}. Valid ids are 1-11 "
+                    f"({', '.join(f'{k}={v}' for k, v in EVENT_COLOR_NAMES.items())}), "
+                    "or '' to revert to the calendar's colour."
+                )
+
+            if not args.get("confirm"):
+                current = svc.get_event(
+                    event_id=args["event_id"], calendar_id=calendar_id
+                )
+                return _preview(
+                    "calendar_set_event_color",
+                    {
+                        "account": args["account"],
+                        "calendar_id": calendar_id,
+                        "event_id": args["event_id"],
+                        "event_summary": current.get("summary", ""),
+                        "event_start": current.get("start", ""),
+                        "current_color": (
+                            f"{current.get('colorId') or 'none'} "
+                            f"({current.get('colorName', 'Default')})"
+                        ),
+                        "new_color": (
+                            f"{color_id} ({EVENT_COLOR_NAMES[color_id]})"
+                            if color_id
+                            else "none (inherit the calendar's colour)"
+                        ),
+                        "note": "Colour only. No other field on the event is changed.",
+                    },
+                    args,
+                )
+
+            _require_confirmation("calendar_set_event_color", args)
+            result = svc.set_event_color(
+                event_id=args["event_id"],
+                color_id=color_id,
+                calendar_id=calendar_id,
+            )
+            _audit(
+                "calendar_set_event_color",
+                args["account"],
+                {
+                    "calendar_id": calendar_id,
+                    "event_id": args["event_id"],
+                    "color_id": color_id or "(cleared)",
+                },
+            )
+            return _fmt(result)
 
         else:
             return _fmt(f"Unknown tool: {name}")
